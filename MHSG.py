@@ -1,23 +1,31 @@
 from itertools import compress
+import copy
 import numpy as np
 import random
 import torch
 import torch.nn.functional as F
+import logging
+logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+                    datefmt='%d-%m-%Y:%H:%M:%S')
+logging.getLogger().setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 class ConstrainedGenText:
     """
     Constraint就是一开始的text的构成
     """
-    def __init__(self, text, mlm_tokenizer):
+    def __init__(self, text, tokenized_text_input_ids, hard_constraint_mask):
         """
         text 是原text，且所有字母小写
-        tokenized_text 是经过PLM tokenize之后的 id list
+        tokenized_text 是经过PLM tokenize之后的，注意是直接tokenize之后，所以包括input_ids、token_type_ids、attention_mask，且dim为2，第一维恒为1
         hard_constraint 是一个sequence的list
         """
         self.text = text.lower()
-        self.mlm_tokenizer = mlm_tokenizer
+        # self.mlm_tokenizer = mlm_tokenizer
         # tokenized_text与进行操作的text一定要一样
-        self.tokenized_text = self.mlm_tokenizer(original_text, add_special_tokens=False, return_tensors="pt")
-        self.hard_constraint_mask = torch.zeros(self.tokenized_text.input_ids.size())
+        # self.tokenized_text = self.mlm_tokenizer(text, add_special_tokens=False, return_tensors="pt")
+        self.tokenized_text = tokenized_text
+        self.hard_constraint_mask = hard_constraint_mask
 
 
     def update_hard_constraint_mask(self, position, action):
@@ -77,6 +85,9 @@ class MHSG:
         self.MLM_tokenizer = MLM_tokenizer
         self.LM_model = LM_model
         self.LM_tokenizer = LM_tokenizer
+        self.replace_prior = 1/3
+        self.insert_prior = 1/3
+        self.delete_prior = 1/3
     def get_position(self, input_text:ConstrainedGenText, last_position:int):
         """
         得到当前操作进行的位置
@@ -84,33 +95,69 @@ class MHSG:
             input_text (ConstrainedGenText): 输入的text
             last_position (int): 上一次进行操作的位置
         """
-        aviable_indices = list(compress(range(len(test_list)), test_list))
+        aviable_indices = list(compress(range(len(input_text.hard_constraint_mask)), input_text.hard_constraint_mask))
         cur_position = random.choice(aviable_indices)
-        assert cur_position < len(input_text.tokenized_text)
+        assert cur_position < len(input_text.tokenized_text.input_ids[0])
         return cur_position
-    def replace(self, input_text:ConstrainedGenText, position:int, topp=0, topk=0):
+    
+    def get_whole_text_prod(self, text:str):
+        self.LM_model.eval()
+        with torch.no_grad():
+            input_ids = self.LM_tokenizer(text, return_tensors='pt').input_ids
+            target_ids = input_ids.clone()
+            text_ppl = torch.exp(self.LM_model(input_ids, labels=target_ids)[0]).item()
+            text_prob = text_ppl ** (-input_ids.size(0))
+        return text_prob
+    def replace(self, input_text, position, top_p=0, top_k=0):
         """
         进行替换操作，
         Args:
-            input_text (ConstrainedGenText): [description]
-            position (int): [description]
+            input_text (ConstrainedGenText): 进行操作的原始Text
+            position (int): 进行操作的位置
         """
         self.LM_model.eval()
         self.MLM_model.eval()
         with torch.no_grad():
-            old_input_ids = self.LM_tokenizer(input_text.text, return_tensors='pt').input_ids
-            old_target_ids = old_input_ids.clone()
-            old_text_ppl = torch.exp(self.LM_model(old_input_ids, labels=old_target_ids)[0]).item()
-            old_text_prob = old_text_ppl ** (-old_input_ids.size(0))
-
+            old_text_prob = self.get_whole_text_prod(input_text.text)
             logits = self.MLM_model(**input_text.tokenized_text).logits[0][position]
 
             if topp != 0 or topk != 0: # sampling
-                logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
-                prev_pred = F.softmax(logits, dim=-1)
-                prev_token = prev_pred.multinomial(num_samples=1)
+                logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+                proposal_prod = F.softmax(logits, dim=-1)
+                proposal_token = proposal_prod.multinomial(num_samples=1)
             else: # greedy search
-                prev_pred = F.softmax(logits, dim=-1)
-                prev_token = prev_pred.argmax(-1)
-            prev_token_pred = prev_pred[prev_token]
-            
+                proposal_prod = F.softmax(logits, dim=-1)
+                proposal_token = proposal_prod.argmax(-1)
+            if proposal_token in self.MLM_tokenizer.all_special_ids: # 如果预测的token是special token，直接返回input_text
+                return copu.deepcopy(input_text)
+
+            proposal_token_prod = proposal_prod[proposal_token] #预测得用于替换的token的条件概率
+            old_token_prod = proposal_prod[input_text.tokenized_text.input_ids[0][position]] #原来的token的条件概率
+
+            proposal_tokenized_text = copy.deepcopy(input_text.tokenized_text) # token_type_ids和attention_mask应该是不变的
+            # 第一个index为0，因为batch_size为1
+            proposal_tokenized_text[0][position] = proposal_token
+            proposal_text = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
+            proposal_text_prob = self.get_whole_text_prod(proposal_text)
+
+            A_replace = min(1, proposal_text_prob * old_token_prod / (old_text_prob * proposal_token_prod))
+            logger.info("=" * 20 + " Replace " + "=" * 20)
+            logger.info("Old Text is : {}".format(input_text.text))
+            logger.info("Proposal Text is : {}".format(proposal_text))
+            logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; Proposal token prob: {ptp} ".format(ar=A_replace, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob, ptp=proposal_token_prod))
+
+            if decision(A_replace):
+                accept_text_hard_constraint_mask = copy_deepcopy(input_text.hard_constraint_mask)
+                accept_text = ConstrainedGenText(proposal_text, proposal_tokenized_text, accept_text_hard_constraint_mask)
+                return accept_text
+            else:
+                return copy.deepcopy(input_text)
+    def insert(self, input_text, position, top_p=0, top_k=0):
+        self.LM_model.eval()
+        self.MLM_model.eval()
+        with torch.no_grad():
+            old_text_prob = self.get_whole_text_prod(input_text.text)
+            # 在position位置插入一个 <mask> 
+
+
+if __name__ == "__main__":
