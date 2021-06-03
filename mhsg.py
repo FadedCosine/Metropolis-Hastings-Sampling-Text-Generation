@@ -15,7 +15,7 @@ class ConstrainedGenText:
     """
     Constraint就是一开始的text的构成
     """
-    def __init__(self, text, tokenized_text_input_ids, hard_constraint_mask):
+    def __init__(self, text, tokenized_text, hard_constraint_mask):
         """
         text 是原text，且所有字母小写
         tokenized_text 是经过PLM tokenize之后的，注意是直接tokenize之后，所以包括input_ids、token_type_ids、attention_mask，且dim为2，第一维恒为1
@@ -89,7 +89,7 @@ class MHSG:
         self.replace_prior = 1/3
         self.insert_prior = 1/3
         self.delete_prior = 1/3
-    def get_position(self, input_text:ConstrainedGenText, last_position:int):
+    def get_position_and_action(self, input_text:ConstrainedGenText, last_position:int):
         """
         得到当前操作进行的位置
         Args:
@@ -97,9 +97,16 @@ class MHSG:
             last_position (int): 上一次进行操作的位置
         """
         aviable_indices = list(compress(range(len(input_text.hard_constraint_mask)), input_text.hard_constraint_mask))
-        cur_position = random.choice(aviable_indices)
-        assert cur_position < len(input_text.tokenized_text.input_ids[0])
-        return cur_position
+        if len(aviable_indices) == 0: #第一次操作：
+            # BERT的tokenizer会在头部加上 CLS 会在尾部加上 SEP
+            cur_position = random.randint(1, len(input_text.tokenized_text.input_ids[0]) - 2)
+            cur_action = "insert"
+            return cur_position, cur_action
+        else:
+            cur_position = random.choice(aviable_indices)
+            cur_action = random.choice(["replace" , "insert", "delete"])
+            assert cur_position < len(input_text.tokenized_text.input_ids[0])
+            return cur_position, cur_action
     
     def get_whole_text_prod(self, text:str):
         self.LM_model.eval()
@@ -134,7 +141,7 @@ class MHSG:
         self.LM_model.eval()
         self.MLM_model.eval()
         with torch.no_grad():
-            logger.info("=" * 20 + " Replace " + "=" * 20)
+            logger.info("=" * 20 + " Replace on Position " + str(position) + "=" * 20)
             logger.info("Old Text is : {}".format(input_text.text))
             old_text_prob = self.get_whole_text_prod(input_text.text)
             proposal_prod, proposal_token = self.get_MLM_prod(input_text, position, top_p, top_k)
@@ -147,13 +154,14 @@ class MHSG:
 
             proposal_tokenized_text = copy.deepcopy(input_text.tokenized_text) # token_type_ids和attention_mask应该是不变的
             # 第一个index为0，因为batch_size为1
-            proposal_tokenized_text.input_ids[0][position] = proposal_token
+            proposal_tokenized_text["input_ids"][0][position] = proposal_token
             proposal_text_str = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
-            proposal_text_prob = self.get_whole_text_prod(proposal_text)
+            proposal_text_prob = self.get_whole_text_prod(proposal_text_str)
 
             A_replace = min(1, proposal_text_prob * old_token_prod / (old_text_prob * proposal_token_prod))
             
             logger.info("Proposal Text is : {}".format(proposal_text_str))
+            
             logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; Proposal token prob: {ptp} ".format(ar=A_replace, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob, ptp=proposal_token_prod))
 
             if decision(A_replace):
@@ -161,6 +169,7 @@ class MHSG:
                 accept_text = ConstrainedGenText(proposal_text_str, proposal_tokenized_text, accept_text_hard_constraint_mask)
                 return accept_text
             else:
+                logger.info("Refuse the Proposal!")
                 return copy.deepcopy(input_text)
 
     def insert(self, input_text, position, top_p=0, top_k=0):
@@ -173,29 +182,39 @@ class MHSG:
         self.LM_model.eval()
         self.MLM_model.eval()
         with torch.no_grad():
-            logger.info("=" * 20 + " Insert " + "=" * 20)
+            logger.info("=" * 20 + " Insert on Position " + str(position) + "=" * 20)
             logger.info("Old Text is : {}".format(input_text.text))
             old_text_prob = self.get_whole_text_prod(input_text.text)
             
             tmp_text = copy.deepcopy(input_text)
             input_text_input_ids = input_text.tokenized_text.input_ids[0]
-            # 在position位置插入一个 <mask> , 103是<mask>对应的id
-            tmp_text_input_ids = torch.cat(input_text_input_ids[:position], 103, input_text_input_ids[position:]).unsqueeze(0)
-            tmp_text.text = self.MLM_tokenizer.batch_decode(tmp_text_input_ids, skip_special_tokens = True)[0]
-            tmp_text.tokenized_text = self.MLM_tokenizer(tmp_text.text) # 因为做了插入操作，tokenized的attention mask会变动，所以必须重新tokenize
+            input_text_token_type_ids = input_text.tokenized_text.token_type_ids[0]
+            input_text_attention_mask = input_text.tokenized_text.attention_mask[0]
+            # 在position位置插入一个 <mask> , 直接插103是<mask>的id
+            tmp_text.tokenized_text['input_ids'] = torch.cat((input_text_input_ids[:position], torch.LongTensor([103]), input_text_input_ids[position:])).unsqueeze(0)
+            # token_type_ids 和 attention_mask 分别在position位置插入0和1
+            tmp_text.tokenized_text['token_type_ids'] = torch.cat((input_text_token_type_ids[:position], torch.LongTensor([0]), input_text_token_type_ids[position:])).unsqueeze(0)
+            tmp_text.tokenized_text['attention_mask'] = torch.cat((input_text_attention_mask[:position], torch.LongTensor([1]), input_text_attention_mask[position:])).unsqueeze(0)
+     
+            tmp_text.text = self.MLM_tokenizer.batch_decode(tmp_text.tokenized_text.input_ids, skip_special_tokens = False)[0]
+            
+            # 因为做了插入操作，tokenized的attention mask会变动
             tmp_text.update_hard_constraint_mask(position, "insert")
-            logger.info("Insert a <MASK>, and then replace it. ")
+            logger.info("Insert a mask, and then replace it. ")
             logger.info("Intermediate Text is : {}".format(tmp_text.text))
 
             proposal_prod, proposal_token = self.get_MLM_prod(tmp_text, position, top_p, top_k)
             if proposal_token in self.MLM_tokenizer.all_special_ids: # 如果预测的token是special token，直接返回input_text
                 logger.info("The proposal token is a special token, so return the original text.")
                 return copy.deepcopy(input_text)
-
+        
             proposal_token_prod = proposal_prod[proposal_token]
             proposal_tokenized_text = copy.deepcopy(tmp_text.tokenized_text) # token_type_ids和attention_mask应该是不变的
             # 第一个index为0，因为batch_size为1
-            proposal_tokenized_text.input_ids[0][position] = proposal_token
+            # logger.info("input_text.tokenized_text is : {}".format(input_text.tokenized_text))
+            # logger.info("tmp_text.tokenized_text is : {}".format(tmp_text.tokenized_text))
+            
+            proposal_tokenized_text["input_ids"][0][position] = proposal_token
             proposal_text_str = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
             proposal_text_prob = self.get_whole_text_prod(proposal_text_str)
 
@@ -208,7 +227,9 @@ class MHSG:
                 accept_text = ConstrainedGenText(proposal_text_str, proposal_tokenized_text, accept_text_hard_constraint_mask)
                 return accept_text
             else:
+                logger.info("Refuse the Proposal!")
                 return copy.deepcopy(input_text)
+
     def delete(self, input_text, position, top_p=0, top_k=0):
         """
         进行删除操作
@@ -219,7 +240,7 @@ class MHSG:
         self.LM_model.eval()
         self.MLM_model.eval()
         with torch.no_grad():
-            logger.info("=" * 20 + " Delete " + "=" * 20)
+            logger.info("=" * 20 + " Delete on Position " + str(position) + "=" * 20)
             logger.info("Old Text is : {}".format(input_text.text))
             old_text_prob = self.get_whole_text_prod(input_text.text)
             proposal_prod, _ = self.get_MLM_prod(input_text, position, top_p, top_k)
@@ -228,21 +249,20 @@ class MHSG:
             proposal_text = copy.deepcopy(input_text)
             input_text_input_ids = input_text.tokenized_text.input_ids[0]
             # 删除掉在position位置的token
-            proposal_text_input_ids = torch.cat(input_text_input_ids[:position], input_text_input_ids[position+1:]).unsqueeze(0)
+            proposal_text_input_ids = torch.cat((input_text_input_ids[:position], input_text_input_ids[position+1:])).unsqueeze(0)
             proposal_text.text = self.MLM_tokenizer.batch_decode(proposal_text_input_ids, skip_special_tokens = True)[0]
-            proposal_text.tokenized_text = self.MLM_tokenizer(proposal_text.text) # 因为做了删除操作，tokenized的attention mask会变动，所以必须重新tokenize
+            proposal_text.tokenized_text = self.MLM_tokenizer(proposal_text.text, return_tensors="pt") # 因为做了删除操作，tokenized的attention mask会变动，所以必须重新tokenize
             proposal_text.update_hard_constraint_mask(position, "delete")
 
-            proposal_text_prob = self.get_whole_text_prod(proposal_text)
+            proposal_text_prob = self.get_whole_text_prod(proposal_text.text)
             A_insert = min(1, self.insert_prior * proposal_text_prob * old_token_prod / (self.delete_prior* old_text_prob))
 
-            logger.info("Proposal Text is : {}".format(proposal_text_str))
-            logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; ".format(ar=A_replace, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob)
+            logger.info("Proposal Text is : {}".format(proposal_text.text))
+            logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; ".format(ar=A_insert, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob))
             
-            if decision(A_replace):
+            if decision(A_insert):
                 return proposal_text
             else:
+                logger.info("Refuse the Proposal!")
                 return copy.deepcopy(input_text)
             
-if __name__ == "__main__":
-    
