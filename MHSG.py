@@ -148,17 +148,17 @@ class MHSG:
             proposal_tokenized_text = copy.deepcopy(input_text.tokenized_text) # token_type_ids和attention_mask应该是不变的
             # 第一个index为0，因为batch_size为1
             proposal_tokenized_text.input_ids[0][position] = proposal_token
-            proposal_text = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
+            proposal_text_str = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
             proposal_text_prob = self.get_whole_text_prod(proposal_text)
 
             A_replace = min(1, proposal_text_prob * old_token_prod / (old_text_prob * proposal_token_prod))
             
-            logger.info("Proposal Text is : {}".format(proposal_text))
+            logger.info("Proposal Text is : {}".format(proposal_text_str))
             logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; Proposal token prob: {ptp} ".format(ar=A_replace, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob, ptp=proposal_token_prod))
 
             if decision(A_replace):
                 accept_text_hard_constraint_mask = copy.deepcopy(input_text.hard_constraint_mask)
-                accept_text = ConstrainedGenText(proposal_text, proposal_tokenized_text, accept_text_hard_constraint_mask)
+                accept_text = ConstrainedGenText(proposal_text_str, proposal_tokenized_text, accept_text_hard_constraint_mask)
                 return accept_text
             else:
                 return copy.deepcopy(input_text)
@@ -180,8 +180,9 @@ class MHSG:
             tmp_text = copy.deepcopy(input_text)
             input_text_input_ids = input_text.tokenized_text.input_ids[0]
             # 在position位置插入一个 <mask> , 103是<mask>对应的id
-            tmp_text.tokenized_text.input_ids = torch.cat(input_text_input_ids[:position], 103, input_text_input_ids[position:]).unsqueeze(0)
-            tmp_text.text = self.MLM_tokenizer.batch_decode(tmp_text.tokenized_text.input_ids, skip_special_tokens = True)[0]
+            tmp_text_input_ids = torch.cat(input_text_input_ids[:position], 103, input_text_input_ids[position:]).unsqueeze(0)
+            tmp_text.text = self.MLM_tokenizer.batch_decode(tmp_text_input_ids, skip_special_tokens = True)[0]
+            tmp_text.tokenized_text = self.MLM_tokenizer(tmp_text.text) # 因为做了插入操作，tokenized的attention mask会变动，所以必须重新tokenize
             tmp_text.update_hard_constraint_mask(position, "insert")
             logger.info("Insert a <MASK>, and then replace it. ")
             logger.info("Intermediate Text is : {}".format(tmp_text.text))
@@ -195,19 +196,53 @@ class MHSG:
             proposal_tokenized_text = copy.deepcopy(tmp_text.tokenized_text) # token_type_ids和attention_mask应该是不变的
             # 第一个index为0，因为batch_size为1
             proposal_tokenized_text.input_ids[0][position] = proposal_token
-            proposal_text = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
-            proposal_text_prob = self.get_whole_text_prod(proposal_text)
+            proposal_text_str = self.MLM_tokenizer.batch_decode(proposal_tokenized_text.input_ids, skip_special_tokens = True)[0]
+            proposal_text_prob = self.get_whole_text_prod(proposal_text_str)
 
             A_insert = min(1, self.delete_prior * proposal_text_prob / (self.insert_prior * old_text_prob * proposal_token_prod))
             
-            logger.info("Proposal Text is : {}".format(proposal_text))
+            logger.info("Proposal Text is : {}".format(proposal_text_str))
             logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old text prob: {op} ; Proposal token prob: {ptp} ".format(ar=A_insert, pp=proposal_text_prob, op=old_text_prob, ptp=proposal_token_prod))
             if decision(A_insert):
                 accept_text_hard_constraint_mask = copy.deepcopy(tmp_text.hard_constraint_mask)
-                accept_text = ConstrainedGenText(proposal_text, proposal_tokenized_text, accept_text_hard_constraint_mask)
+                accept_text = ConstrainedGenText(proposal_text_str, proposal_tokenized_text, accept_text_hard_constraint_mask)
                 return accept_text
             else:
                 return copy.deepcopy(input_text)
-            
+    def delete(self, input_text, position, top_p=0, top_k=0):
+        """
+        进行删除操作
+        Args:
+            input_text (ConstrainedGenText): 进行操作的原始Text
+            position (int): 进行操作的位置
+        """
+        self.LM_model.eval()
+        self.MLM_model.eval()
+        with torch.no_grad():
+            logger.info("=" * 20 + " Delete " + "=" * 20)
+            logger.info("Old Text is : {}".format(input_text.text))
+            old_text_prob = self.get_whole_text_prod(input_text.text)
+            proposal_prod, _ = self.get_MLM_prod(input_text, position, top_p, top_k)
+            old_token_prod = proposal_prod[input_text.tokenized_text.input_ids[0][position]] #原来的token的条件概率
 
+            proposal_text = copy.deepcopy(input_text)
+            input_text_input_ids = input_text.tokenized_text.input_ids[0]
+            # 删除掉在position位置的token
+            proposal_text_input_ids = torch.cat(input_text_input_ids[:position], input_text_input_ids[position+1:]).unsqueeze(0)
+            proposal_text.text = self.MLM_tokenizer.batch_decode(proposal_text_input_ids, skip_special_tokens = True)[0]
+            proposal_text.tokenized_text = self.MLM_tokenizer(proposal_text.text) # 因为做了删除操作，tokenized的attention mask会变动，所以必须重新tokenize
+            proposal_text.update_hard_constraint_mask(position, "delete")
+
+            proposal_text_prob = self.get_whole_text_prod(proposal_text)
+            A_insert = min(1, self.insert_prior * proposal_text_prob * old_token_prod / (self.delete_prior* old_text_prob))
+
+            logger.info("Proposal Text is : {}".format(proposal_text_str))
+            logger.info("Accept rate: {ar} ; Proposal text prob: {pp} ; Old token prob: {otp} ; Old text prob: {op} ; ".format(ar=A_replace, pp=proposal_text_prob, otp=old_token_prod, op=old_text_prob)
+            
+            if decision(A_replace):
+                return proposal_text
+            else:
+                return copy.deepcopy(input_text)
+            
 if __name__ == "__main__":
+    
