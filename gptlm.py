@@ -1,0 +1,67 @@
+import jsonlines
+from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
+from nltk.stem.lancaster import LancasterStemmer
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
+import torch
+import torch.nn as nn
+import  tqdm
+import  argparse
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+lst = LancasterStemmer()
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+loss_fn = nn.CrossEntropyLoss()
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+class mytrainset(Dataset):
+    def __init__(self):
+        self.res = []
+        with jsonlines.open('./commongen_data/commongen_data/commongen.train.jsonl') as reader:
+            for line in reader:
+                scene = line['scene']
+                for sentence in scene:
+                    self.res.append([sentence])
+                                #print([" ".join(masked_sent)," ".join(sentence)])
+    def __getitem__(self, item):
+        return self.res[item]
+    def __len__(self):
+        return len(self.res)
+
+
+
+def train(args):
+    dataset = mytrainset()
+    trainsampler = RandomSampler(dataset)
+    trainloader = DataLoader(dataset, sampler=trainsampler, batch_size=args.btsize)
+    model =GPT2LMHeadModel.from_pretrained('gpt2')
+    model = model.to(device)
+    model.resize_token_embeddings(len(tokenizer))
+    model = nn.DataParallel(model)
+    model.train()
+    optimzer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    for epoch in range(args.n_epoch):
+        for data in tqdm.tqdm(trainloader):
+            # print(data[0])
+            #print(data[0])
+            inputs = tokenizer(data[0],return_tensors='pt',padding=True).to(device)
+            # print(inputs["input_ids"])
+            # print(labels)
+            # print(inputs["input_ids"].shape)
+            # print(labels.shape)
+            outputs =model(**inputs,labels=inputs["input_ids"].to(device))
+            loss = torch.mean(outputs.loss)
+            optimzer.zero_grad()
+            loss.backward()
+            optimzer.step()
+    torch.save(model.state_dict(),"gpt2LM")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--btsize",type=int)
+    parser.add_argument("--n_epoch", type=int)
+    args = parser.parse_args()
+    train(args)
+
+main()

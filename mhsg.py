@@ -96,16 +96,22 @@ class MHSG:
             input_text (ConstrainedGenText): 输入的text
             last_position (int): 上一次进行操作的位置
         """
+        
         aviable_indices = list(compress(range(len(input_text.hard_constraint_mask)), input_text.hard_constraint_mask))
         if len(aviable_indices) == 0: #第一次操作：
             # BERT的tokenizer会在头部加上 CLS 会在尾部加上 SEP
             cur_position = random.randint(1, len(input_text.tokenized_text.input_ids[0]) - 2)
             cur_action = "insert"
+            logger.info("input_text.hard_constraint_mask is : {}".format(input_text.hard_constraint_mask))
+            logger.info("cur_position is : {}".format(cur_position))
             return cur_position, cur_action
         else:
             cur_position = random.choice(aviable_indices)
             cur_action = random.choice(["replace" , "insert", "delete"])
+            logger.info("input_text.hard_constraint_mask is : {}".format(input_text.hard_constraint_mask))
+            logger.info("cur_position is : {}".format(cur_position))
             assert cur_position < len(input_text.tokenized_text.input_ids[0])
+            
             return cur_position, cur_action
     
     def get_whole_text_prod(self, text:str):
@@ -248,10 +254,13 @@ class MHSG:
 
             proposal_text = copy.deepcopy(input_text)
             input_text_input_ids = input_text.tokenized_text.input_ids[0]
+            input_text_token_type_ids = input_text.tokenized_text.token_type_ids[0]
+            input_text_attention_mask = input_text.tokenized_text.attention_mask[0]
             # 删除掉在position位置的token
-            proposal_text_input_ids = torch.cat((input_text_input_ids[:position], input_text_input_ids[position+1:])).unsqueeze(0)
-            proposal_text.text = self.MLM_tokenizer.batch_decode(proposal_text_input_ids, skip_special_tokens = True)[0]
-            proposal_text.tokenized_text = self.MLM_tokenizer(proposal_text.text, return_tensors="pt") # 因为做了删除操作，tokenized的attention mask会变动，所以必须重新tokenize
+            proposal_text.tokenized_text['input_ids'] = torch.cat((input_text_input_ids[:position], input_text_input_ids[position+1:])).unsqueeze(0)
+            proposal_text.tokenized_text['token_type_ids'] = torch.cat((input_text_token_type_ids[:position], input_text_token_type_ids[position+1:])).unsqueeze(0)
+            proposal_text.tokenized_text['attention_mask'] = torch.cat((input_text_attention_mask[:position], input_text_attention_mask[position+1:])).unsqueeze(0)
+            proposal_text.text = self.MLM_tokenizer.batch_decode(proposal_text.tokenized_text.input_ids, skip_special_tokens = True)[0]
             proposal_text.update_hard_constraint_mask(position, "delete")
 
             proposal_text_prob = self.get_whole_text_prod(proposal_text.text)
