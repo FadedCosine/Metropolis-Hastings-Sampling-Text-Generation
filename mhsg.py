@@ -98,7 +98,7 @@ class MHSG:
         """
         
         aviable_indices = list(compress(range(len(input_text.hard_constraint_mask)), input_text.hard_constraint_mask))
-        if len(aviable_indices) == 0: #第一次操作：
+        if len(aviable_indices) == 0 or last_position == -1: #第一次操作：
             # BERT的tokenizer会在头部加上 CLS 会在尾部加上 SEP
             cur_position = random.randint(1, len(input_text.tokenized_text.input_ids[0]) - 2)
             cur_action = "insert"
@@ -106,8 +106,15 @@ class MHSG:
             logger.info("cur_position is : {}".format(cur_position))
             return cur_position, cur_action
         else:
-            cur_position = random.choice(aviable_indices)
             cur_action = random.choice(["replace" , "insert", "delete"])
+            if cur_action != "insert":
+                try:
+                    cur_position_idx = ((aviable_indices.index(last_position)) + 1) % len(aviable_indices)
+                    cur_position = aviable_indices[cur_position_idx]
+                except ValueError:
+                    cur_position = aviable_indices[0]
+            else:
+                cur_position = ramdom.randont(1,len(input_text.tokenized_text.input_ids[0])-2)
             logger.info("input_text.hard_constraint_mask is : {}".format(input_text.hard_constraint_mask))
             logger.info("cur_position is : {}".format(cur_position))
             assert cur_position < len(input_text.tokenized_text.input_ids[0])
