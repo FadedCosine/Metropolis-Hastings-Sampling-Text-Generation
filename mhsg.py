@@ -114,7 +114,7 @@ class MHSG:
                 except ValueError:
                     cur_position = aviable_indices[0]
             else:
-                cur_position = ramdom.randont(1,len(input_text.tokenized_text.input_ids[0])-2)
+                cur_position = random.randint(1,len(input_text.tokenized_text.input_ids[0])-2)
             logger.info("input_text.hard_constraint_mask is : {}".format(input_text.hard_constraint_mask))
             logger.info("cur_position is : {}".format(cur_position))
             assert cur_position < len(input_text.tokenized_text.input_ids[0])
