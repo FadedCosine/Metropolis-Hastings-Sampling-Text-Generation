@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=7 python run_1_billion.py
+CUDA_VISIBLE_DEVICES=0 python run_1_billion.py
